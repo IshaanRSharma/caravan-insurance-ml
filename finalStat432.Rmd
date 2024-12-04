@@ -1,0 +1,406 @@
+---
+title: "STAT432_final"
+author: "Ishaan Sharma"
+date: "2024-04-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+### Base Model 1: Logistic Regression 
+
+```{r cache=TRUE}
+
+caravan_data <- read.csv("caravan-insurance-challenge.csv")
+train_data <- caravan_data[caravan_data$ORIGIN == "train", ]
+test_data <- caravan_data[caravan_data$ORIGIN == "test", ]
+
+
+train_data <- train_data[, !names(train_data) %in% "ORIGIN"]
+test_data <- test_data[, !names(test_data) %in% "ORIGIN"]
+
+print(test_data)
+```
+
+Checking imbalances of dataset, and balancing data because of the imbalance in the response variable CARAVAN
+```{r cache=TRUE}
+library(ROSE)
+
+set.seed(7)
+table(train_data$CARAVAN)
+prop.table(table(train_data$CARAVAN))
+
+balanced_train_data <- ROSE(CARAVAN ~ ., data = train_data, seed = 1)$data
+table(balanced_train_data$CARAVAN)
+prop.table(table(balanced_train_data$CARAVAN))
+```
+
+
+
+```{r}
+library(ggplot2)
+library(reshape2)  # for melt function
+numeric_data <- data.frame(lapply(caravan_data, function(x) if(is.factor(x)) as.numeric(as.character(x)) else x))
+
+numeric_data <- numeric_data[, sapply(numeric_data, is.numeric)]
+cor_matrix <- cor(numeric_data, use = "complete.obs") 
+# Convert matrix to long format for ggplot
+cor_melted <- melt(cor_matrix)
+
+# Create heatmap
+ggplot(data = cor_melted, aes(x=Var1, y=Var2, fill=value)) +
+    geom_tile() +
+    scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, limit = c(-1,1), space = "Lab", name="Pearson\nCorrelation") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+    la
+```
+
+```{r cache=TRUE}
+# Model 1 training, ridge-regression
+library(glmnet)
+library(caret) 
+library(pROC)
+
+set.seed(7)
+
+train_X <- data.matrix(balanced_train_data[, !names(train_data) %in% "CARAVAN"])
+train_Y <- factor(balanced_train_data$CARAVAN)
+test_X <- data.matrix(test_data[, !names(test_data) %in% "CARAVAN"])
+test_Y <- factor(test_data$CARAVAN)
+
+q1_measure <- "auc"
+q1_numFolds <- 20
+q1_alpha <- 0  # Ridge
+q1_family <- "binomial"
+
+caravan_ridge_model <- cv.glmnet(
+  x = train_X,
+  y = train_Y,
+  type.measure = q1_measure,
+  nfolds = q1_numFolds,
+  alpha = q1_alpha,
+  family = q1_family
+)
+
+best_lambda <- caravan_ridge_model$lambda.min # Best lambda:  0.0484061059608057"
+print(paste("Best lambda: ", best_lambda))
+print(caravan_ridge_model)
+
+ridge_model <- glmnet(x = train_X, y =train_Y, family = "binomial", alpha = 0, lambda = best_lambda)
+print(summary(ridge_model))
+
+predicted_probs <- predict(ridge_model, newx = test_X, type = "response")
+roc_curve <- roc(test_Y, predicted_probs[,1])
+predicted_classes <- factor(ifelse(predicted_probs > 0.5, 1, 0), levels = c(0, 1))
+
+confusion_matrix <- table(Predictions = predicted_classes, Actual = test_Y)
+TP <- confusion_matrix[2, 2]
+FP <- confusion_matrix[1, 2]
+FN <- confusion_matrix[2, 1]
+
+coefficients <- coef(ridge_model)
+print(coefficients)
+plot(coefficients, main = "Feature Importance from Ridge Regression")
+
+# Calculate metrics 
+auc_value <- auc(roc_curve)
+accuracy <- sum(diag(confusion_matrix)) / sum(confusion_matrix)
+precision <- TP / (TP + FP)
+recall <- TP / (TP + FN)
+f1_score <- 2 * (precision * recall) / (precision + recall)
+
+print(paste("Accuracy: ", accuracy))
+print(paste("Precision: ", precision))
+print(paste("Recall: ", recall))
+print(paste("F1 Score: ", f1_score))
+print(paste("auc:: ", auc_value))
+print(confusion_matrix)
+```
+
+```{r}
+library(Matrix)
+coefficients_vec <- as.vector(coefficients)
+
+feature_names <- rownames(coefficients)
+names(coefficients_vec) <- feature_names
+sorted_coeffs <- sort(abs(coefficients_vec), decreasing = TRUE)
+top_features_names <- names(sorted_coeffs)[2:18]
+top_features <- sorted_coeffs[2:18]
+print(top_features_names)
+print(top_features)
+
+top_features_df <- data.frame(
+  Feature = top_features_names,
+  Importance = top_features
+)
+
+ggplot(top_features_df, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +  # Makes the plot horizontal for easier reading of feature names
+  labs(title = "Top 17 Feature Importance from Ridge Regression", x = "Features", y = "Importance") +
+  theme_minimal()
+
+```
+
+```{r cache=TRUE}
+library(gbm)
+library(caret) 
+library(dplyr)
+
+set.seed(7)
+
+n_trees <- c(100, 500, 1000)
+shrinkage_values <- c(0.01, 0.05, 0.1)
+depth_values <- c(1, 3, 5)
+
+best_model <- NULL
+lowest_cv_error <- Inf
+best_params <- list(n.trees = NULL, shrinkage = NULL, interaction.depth = NULL)
+
+cv_folds <- 10
+
+
+for (n in n_trees) {
+  for (shrinkage in shrinkage_values) {
+    for (depth in depth_values) {
+      
+      model_gbm <- gbm(CARAVAN ~ .,
+                       data = balanced_train_data,
+                       distribution = "bernoulli",
+                       n.trees = n,
+                       shrinkage = shrinkage,
+                       interaction.depth = depth,
+                       n.minobsinnode = 10,
+                       cv.folds = cv_folds,
+                       verbose = FALSE)
+
+      cv_error <- min(model_gbm$cv.error)
+
+      if (cv_error < lowest_cv_error) {
+        best_model <- model_gbm
+        lowest_cv_error <- cv_error
+        best_params <- list(n.trees = n, shrinkage = shrinkage, interaction.depth = depth)
+      }
+      
+    }
+  }
+}
+
+print(paste("Best number of trees:", best_params$n.trees))
+print(paste("Best shrinkage value:", best_params$shrinkage))
+print(paste("Best interaction depth:", best_params$interaction.depth))
+
+final_model <- gbm(CARAVAN ~ .,
+                   data = train_data,
+                   distribution = "bernoulli",
+                   n.trees = best_params$n.trees,
+                   shrinkage = best_params$shrinkage,
+                   interaction.depth = best_params$interaction.depth,
+                   n.minobsinnode = 10,
+                   verbose = TRUE)
+
+summary(final_model)
+```
+
+```{r}
+print(best_params$n.trees)
+predicted_probs <- predict(final_model, test_data, type = "response", n.trees = best_params$n.trees)
+
+predicted_classes <- ifelse(predicted_probs > 0.5, 1, 0)
+predicted_classes <- factor(predicted_classes, levels = c(0, 1))
+actual_classes <- factor(test_data$CARAVAN, levels = c(0, 1))
+conf_matrix <- confusionMatrix(predicted_classes, actual_classes)
+print(conf_matrix)
+
+importance <- summary(final_model, n.trees = best_params$n.trees, cBars = 20)
+
+# Create a data frame for the importance
+importance_df <- data.frame(
+  Feature = rownames(importance),
+  Importance = importance$rel.inf
+)
+```
+
+```{r}
+
+top_17_features <- importance_df %>%
+  arrange(desc(Importance)) %>%
+  top_n(17, Importance)
+
+top_17_features <- head(top_17_features, 17)
+
+print(top_17_features)
+
+ggplot(top_17_features, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +  
+  labs(title = "Top 17 Feature Importance from GBM Model", x = "Features", y = "Relative Importance") +
+  theme_minimal()
+
+```
+
+```{r}
+library(caret)
+library(class)
+
+important_features <- top_17_features[, 1]
+train_X_reduced <- train_data[, c(important_features, "CARAVAN")]
+test_X_reduced <- test_data[, c(important_features, "CARAVAN")]
+
+preProcValues <- preProcess(test_X_reduced[, -ncol(train_X_reduced)], method = 'scale')
+train_scaled_knn_reduced <- predict(preProcValues, train_X_reduced)
+test_scaled_knn_reduced <- predict(preProcValues, test_X_reduced)
+balanced_training_knn_reduced <- ROSE(CARAVAN ~ ., data = train_scaled_knn_reduced, seed = 42)$data
+
+train_y_knn_reduced <- factor((balanced_training_knn_reduced$CARAVAN), levels = c(0, 1), labels = c("class0", "class1"))
+train_X_knn_reduced <- balanced_training_knn_reduced %>% select(-CARAVAN)
+
+test_y_knn_reduced <- factor((test_scaled_knn_reduced$CARAVAN), levels = c(0, 1), labels = c("class0", "class1"))
+test_X_knn_reduced <- test_scaled_knn_reduced %>% select(-CARAVAN)
+
+tuning_grid_reduced <- expand.grid(k = seq(1, sqrt(length(test_X_knn_reduced)), by = 2))
+
+train_control <- trainControl(
+  method = "cv",
+  number = 10,
+  savePredictions = "final",
+  classProbs = TRUE,  
+  summaryFunction = twoClassSummary
+)
+
+
+knn_model_reduced <- train(
+  x = train_X_knn_reduced,
+  y = train_y_knn_reduced,
+  method = "knn",
+  trControl = train_control,
+  tuneGrid = tuning_grid_reduced,
+  metric = "ROC" 
+)
+
+optimal_k_reduced <- knn_model_reduced$bestTune$k
+
+knn_reduced <- knn(train = train_X_knn_reduced, test = test_X_knn_reduced, cl = train_y_knn_reduced, k = optimal_k_reduced)
+conf_matrix_reduced <- confusionMatrix(as.factor(knn_reduced), as.factor(test_y_knn_reduced))
+print(conf_matrix_reduced)
+
+```
+
+### Model KNN 
+```{r cache=TRUE}
+# Model 3: KNN 
+library(caret)
+library(ROSE)  # For balancing
+library(dplyr)
+library(class)
+
+set.seed(7)
+
+# normalize data 
+preProcValues <- preProcess(train_data[, -ncol(train_data)], method = 'scale')  #
+train_scaled_knn <- predict(preProcValues, train_data)
+test_scaled_knn <- predict(preProcValues, test_data)
+balanced_training_knn <- ROSE(CARAVAN ~ ., data = train_scaled_knn, seed = 42)$data
+
+train_y_knn <- factor((balanced_training_knn$CARAVAN), levels = c(0, 1), labels = c("class0", "class1"))
+train_X_knn <- balanced_training_knn %>% select(-CARAVAN)
+
+test_y_knn <- factor((test_scaled_knn$CARAVAN), levels = c(0, 1), labels = c("class0", "class1"))
+test_X_knn <- test_scaled_knn %>% select(-CARAVAN)
+```
+
+
+
+```{r cache=TRUE}
+library(caret)
+library(ROSE)  # For balancing
+library(dplyr)
+library(class)
+
+train_control <- trainControl(
+  method = "cv",
+  number = 10,
+  savePredictions = "final",
+  classProbs = TRUE,  
+  summaryFunction = twoClassSummary
+)
+
+tuning_grid <- expand.grid(k = seq(1, sqrt(length(train_X_knn)), by = 2))
+
+knn_model <- train(
+  x = train_X_knn,
+  y = train_y_knn,
+  method = "knn",
+  trControl = train_control,
+  tuneGrid = tuning_grid,
+  metric = "ROC" 
+)
+
+optimal_k <- knn_model$bestTune$k
+print(optimal_k)
+
+knn_final <- knn(train = train_X_knn, test = test_X_knn, cl = train_y_knn, k = optimal_k)
+conf_matrix_full <- confusionMatrix(as.factor(knn_final), as.factor(test_y_knn))
+print(conf_matrix_full)
+```
+
+
+```{r cache=TRUE}
+library(keras)
+library(tensorflow)
+library(caret)
+library(ROSE)
+
+set.seed(7)
+
+preProcValues <- preProcess(train_data[, -ncol(train_data)], method = 'scale')
+train_scaled <- predict(preProcValues, train_data)
+test_scaled <- predict(preProcValues, test_data)
+
+balanced_training_ann <- ROSE(CARAVAN ~ ., data = train_scaled, seed = 42)$data
+
+train_x <- as.matrix(balanced_training_ann[, -ncol(balanced_training_ann)])
+train_y <- as.matrix(balanced_training_ann$CARAVAN)  
+test_x <- as.matrix(test_scaled[, -ncol(test_scaled)])
+test_y <- as.matrix(test_scaled$CARAVAN)  
+
+model <- keras_model_sequential() %>%
+  layer_dense(units = 32, activation = 'relu', input_shape = c(ncol(train_x))) %>%
+  layer_dense(units = 16, activation = 'relu') %>%
+  layer_dense(units = 1, activation = 'sigmoid')  
+
+model %>% compile(
+  loss = 'binary_crossentropy',
+  optimizer = 'adam',
+  metrics = c('accuracy')
+)
+
+history <- model %>% fit(
+  train_x, train_y,
+  epochs = 50,
+  batch_size = 16,
+  validation_split = 0.2
+)
+
+results <- model %>% evaluate(test_x, test_y)
+print(results)
+
+test_predictions <- model %>% predict(test_x)
+test_predictions <- ifelse(test_predictions > 0.5, 1, 0)
+
+test_y <- factor(test_y, levels = c(0, 1), labels = c("class0", "class1"))
+test_predictions <- factor(test_predictions, levels = c(0, 1), labels = c("class0", "class1"))
+
+# Evaluate the model
+c_matrix <- confusionMatrix(test_predictions, test_y, positive = "class1")
+print(c_matrix)
+```
